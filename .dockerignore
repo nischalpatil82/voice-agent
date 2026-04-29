@@ -1,0 +1,17 @@
+.git
+.github
+.env
+.env.*
+!.env.example
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.log
+*.wav
+*.webm
+tests
+benchmarks
+pytest.ini
+requirements-dev.txt
