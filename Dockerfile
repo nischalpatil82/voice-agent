@@ -17,6 +17,7 @@ RUN apt-get update \
        ffmpeg \
        libportaudio2 \
        curl \
+       ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt ./
