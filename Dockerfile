@@ -1,24 +1,3 @@
-FROM python:3.11-slim AS builder
-
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
-
-WORKDIR /build
-
-# Build dependencies for packages that compile native extensions.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-       gcc \
-       g++ \
-       portaudio19-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-COPY requirements.txt ./
-RUN python -m pip install --upgrade pip \
-    && python -m pip wheel --wheel-dir /wheels -r requirements.txt
-
-
 FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -32,16 +11,20 @@ WORKDIR /app
 # Runtime packages only.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
+       gcc \
+       g++ \
+       portaudio19-dev \
        ffmpeg \
        libportaudio2 \
        curl \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt ./
-COPY --from=builder /wheels /wheels
 RUN python -m pip install --upgrade pip \
-    && python -m pip install --no-index --find-links=/wheels -r requirements.txt \
-    && rm -rf /wheels
+    && python -m pip install --no-cache-dir -r requirements.txt \
+    && apt-get purge -y gcc g++ portaudio19-dev \
+    && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY . .
 
