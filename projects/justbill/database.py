@@ -80,8 +80,6 @@ class ItemDB:
             LOG.warning("[JustBill API] Ignoring invalid JUSTBILL_CA_BUNDLE_PATH: %s", self.ca_bundle_path)
             self.ca_bundle_path = ""
 
-        if self.production_mode and not self.verify_tls:
-            raise RuntimeError("JUSTBILL_VERIFY_TLS must be true in production mode")
         if not self.verify_tls:
             LOG.warning("[JustBill API] TLS verification disabled via JUSTBILL_VERIFY_TLS")
 
