@@ -1133,6 +1133,20 @@ def create_app(project_name):
             return jsonify({"job_id": job_id, "status": record.get("status")}), 202
         return jsonify({"job_id": job_id, "status": "done", "result": record.get("result")})
 
+    @app.route("/_debug/echo", methods=["POST"])
+    def debug_echo():
+        """Temporary debug endpoint: returns proxied headers and raw body."""
+        try:
+            headers = dict(request.headers)
+            raw = request.get_data(cache=True)
+            try:
+                body_text = raw.decode('utf-8', errors='replace')
+            except Exception:
+                body_text = "<binary>"
+            return jsonify({"headers": headers, "body": body_text, "len": len(raw)})
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
     @app.route("/reload", methods=["POST"])
     def reload_agent():
         """Reload items from DB and retrain classifier."""
@@ -1219,7 +1233,14 @@ def create_app(project_name):
             # Save uploaded audio
             tmp_fd, tmp_webm = tempfile.mkstemp(suffix=".webm")
             os.close(tmp_fd)
-            audio_file.save(tmp_webm)
+            if hasattr(audio_file, "save"):
+                audio_file.save(tmp_webm)
+            elif isinstance(audio_file, bytes):
+                with open(tmp_webm, "wb") as f:
+                    f.write(audio_file)
+            else:
+                return "", "Invalid audio data format"
+            
             webm_size = os.path.getsize(tmp_webm)
             log.info(f"[Audio] Received: {webm_size} bytes")
 
@@ -1407,6 +1428,97 @@ def create_app(project_name):
         except Exception as e:
             log.error(f"[Speak] {type(e).__name__}: {e}")
             return jsonify({"error": "Speech synthesis failed"}), 500
+
+
+    @app.route("/voice-command-async", methods=["POST"])
+    def voice_command_async():
+        """Async version of voice command to avoid Netlify proxy timeouts."""
+        try:
+            audio_file = request.files.get("audio")
+            if not audio_file:
+                return jsonify({"error": "No audio file"}), 400
+            
+            # Read bytes to pass to background thread
+            audio_bytes = audio_file.read()
+            
+            page = request.form.get("page", "unknown")
+            if len(page) > 80:
+                page = page[:80]
+                
+            frontend_context = {}
+            context_raw = request.form.get("context_json") or request.form.get("context")
+            if context_raw:
+                try:
+                    frontend_context = _normalize_frontend_context(json.loads(context_raw))
+                except Exception:
+                    pass
+
+            session_id = g.session_id
+            job_id = secrets.token_hex(12)
+            with app._jobs_lock:
+                app._jobs[job_id] = {"status": "pending", "created_at": time.time()}
+
+            def _worker(jid, a_bytes, pg, ctx_data, sid):
+                with app.test_request_context():
+                    g.session_id = sid
+                    start_time = time.time()
+                    try:
+                        text, error = _process_audio(a_bytes, frontend_context=ctx_data)
+                        if error or not text:
+                            _store_job_result(jid, {
+                                "text": "",
+                                "error": error or "Could not understand audio",
+                                "message": "Could not understand audio. Please try again.",
+                                "session_id": sid
+                            })
+                            return
+                            
+                        # Process text command
+                        classify_text = _normalize_category_browse_text(text)
+                        intent, confidence = agent["clf"].predict(classify_text)
+                        warn_threshold = _intent_warn_threshold(agent["config"], intent)
+                        
+                        if confidence < warn_threshold and intent != "OUT_OF_SCOPE" and not _is_confirmation_reply(text):
+                            response_time = time.time() - start_time
+                            app.analytics.log_command(text, "CLARIFY", confidence, response_time)
+                            res = _clarification_response(text, intent, confidence, pg)
+                            res["session_id"] = sid
+                            _store_job_result(jid, res)
+                            return
+                            
+                        # Need fake ctx object
+                        class DummyCtx:
+                            pass
+                        dummy_ctx = DummyCtx()
+                        dummy_ctx.last_frontend_context = ctx_data
+                        
+                        cmd_result = agent["builder"].build(intent, text, agent["matcher"], dummy_ctx)
+                        actions = _extract_actions(cmd_result.get("json", ""))
+                        
+                        response_time = time.time() - start_time
+                        app.analytics.log_command(text, cmd_result["intent"], confidence, response_time)
+                        
+                        _store_job_result(jid, {
+                            "text":       text,
+                            "intent":     cmd_result["intent"],
+                            "confidence": confidence,
+                            "message":    cmd_result["message"],
+                            "actions":    actions,
+                            "page":       pg,
+                            "low_conf":   confidence < warn_threshold,
+                            "session_id": sid,
+                        })
+                    except Exception as e:
+                        log.error(f"[VoiceAsyncWorker] {e}")
+                        _store_job_result(jid, {"error": "Processing failed", "session_id": sid})
+
+            thr = threading.Thread(target=_worker, args=(job_id, audio_bytes, page, frontend_context, session_id), daemon=True)
+            thr.start()
+            return jsonify({"job_id": job_id, "status": "pending"}), 202
+
+        except Exception as e:
+            log.error(f"[VoiceCmdAsync] {type(e).__name__}: {e}")
+            return jsonify({"error": "Failed to start async voice job"}), 500
 
     @app.route("/voice-command", methods=["POST"])
     def voice_command():
