@@ -1,0 +1,24 @@
+[build]
+command = "echo 'Netlify build'"
+publish = "."
+functions = "netlify_functions"
+
+[build.environment]
+VOICE_AGENT_BACKEND_URL = "http://13.51.255.22"
+
+[[redirects]]
+from = "/netlify/functions/*"
+to = "/.netlify/functions/:splat"
+status = 200
+
+[context.production]
+[context.production.environment]
+VOICE_AGENT_BACKEND_URL = "http://13.51.255.22"
+
+[context.deploy-preview]
+[context.deploy-preview.environment]
+VOICE_AGENT_BACKEND_URL = "http://13.51.255.22"
+
+[context.branch-deploy]
+[context.branch-deploy.environment]
+VOICE_AGENT_BACKEND_URL = "http://13.51.255.22"
