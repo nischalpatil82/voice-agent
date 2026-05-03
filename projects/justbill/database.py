@@ -140,7 +140,8 @@ class ItemDB:
 
         degraded_reason = ""
         is_degraded = False
-        if self.last_source != "live":
+        using_cached_or_fallback = self.last_source in {"cache", "fallback", "live+fallback"}
+        if self.last_source != "live" and not (using_cached_or_fallback and self.items):
             is_degraded = True
             degraded_reason = self.last_error or f"serving {self.last_source} catalog"
 

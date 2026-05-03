@@ -1004,46 +1004,9 @@ def create_app(project_name):
                 ctx.last_frontend_context = frontend_context
 
         try:
-            # 1. Classify intent
-            classify_text = _normalize_category_browse_text(text)
-            intent, confidence = agent["clf"].predict(classify_text)
-            warn_threshold = _intent_warn_threshold(agent["config"], intent)
-
-            if ctx is not None:
-                setattr(ctx, "last_intent_confidence", confidence)
-                setattr(ctx, "last_intent_warn_threshold", warn_threshold)
-
-            if confidence < warn_threshold and intent != "OUT_OF_SCOPE" and not _is_confirmation_reply(text):
-                if ctx is not None:
-                    ctx.pending_action = {
-                        "intent": intent,
-                        "text": text,
-                        "created_at": time.time(),
-                    }
-                response_time = time.time() - start_time
-                app.analytics.log_command(text, "CLARIFY", confidence, response_time)
-                return jsonify(_clarification_response(text, intent, confidence, page))
-
-            # 2. Build action
-            result = agent["builder"].build(
-                intent, text, agent["matcher"], ctx
-            )
-
-            # 3. Parse actions
-            actions = _extract_actions(result.get("json", ""))
-
-            response_time = time.time() - start_time
-            app.analytics.log_command(text, result["intent"], confidence, response_time)
-
-            return jsonify({
-                "intent":     result["intent"],
-                "confidence": confidence,
-                "message":    result["message"],
-                "actions":    actions,
-                "page":       page,
-                "low_conf":   confidence < warn_threshold,
-                "session_id": g.session_id,
-            })
+            # Delegate to shared processor
+            payload = _process_text_command(text, page, frontend_context, g.session_id, start_time)
+            return jsonify(payload)
 
         except Exception as e:
             app.analytics.log_error(text, e)
@@ -1054,6 +1017,121 @@ def create_app(project_name):
                 "message": "Something went wrong. Please try again.",
                 "session_id": g.session_id,
             }), 500
+
+    # ── Async command job support ──
+    app._jobs = {}
+    app._jobs_lock = threading.Lock()
+
+    def _store_job_result(job_id, result_obj):
+        with app._jobs_lock:
+            app._jobs[job_id] = {
+                "status": "done",
+                "result": result_obj,
+                "finished_at": time.time(),
+            }
+
+    def _process_text_command(text, page, frontend_context, session_id, start_time=None):
+        """Shared processor for command logic. Returns result dict."""
+        if start_time is None:
+            start_time = time.time()
+
+        ctx = None
+        try:
+            # Re-establish session context for background jobs if possible
+            if session_id:
+                sid, ctx = app.session_manager.get_or_create(session_id)
+
+            classify_text = _normalize_category_browse_text(text)
+            intent, confidence = agent["clf"].predict(classify_text)
+            warn_threshold = _intent_warn_threshold(agent["config"], intent)
+
+            if ctx is not None:
+                try:
+                    setattr(ctx, "last_intent_confidence", confidence)
+                    setattr(ctx, "last_intent_warn_threshold", warn_threshold)
+                    if hasattr(ctx, "set_frontend_context"):
+                        ctx.set_frontend_context(frontend_context)
+                    else:
+                        ctx.last_frontend_context = frontend_context
+                except Exception:
+                    pass
+
+            if confidence < warn_threshold and intent != "OUT_OF_SCOPE" and not _is_confirmation_reply(text):
+                if ctx is not None:
+                    try:
+                        ctx.pending_action = {
+                            "intent": intent,
+                            "text": text,
+                            "created_at": time.time(),
+                        }
+                    except Exception:
+                        pass
+                response_time = time.time() - start_time
+                app.analytics.log_command(text, "CLARIFY", confidence, response_time)
+                return _clarification_response(text, intent, confidence, page)
+
+            result = agent["builder"].build(intent, text, agent["matcher"], ctx)
+            actions = _extract_actions(result.get("json", ""))
+
+            response_time = time.time() - start_time
+            app.analytics.log_command(text, result["intent"], confidence, response_time)
+
+            return {
+                "intent":     result["intent"],
+                "confidence": confidence,
+                "message":    result.get("message"),
+                "actions":    actions,
+                "page":       page,
+                "low_conf":   confidence < warn_threshold,
+                "session_id": session_id,
+            }
+        except Exception as e:
+            app.analytics.log_error(text, e)
+            log.error(f"[Command] Background Error: {e}", exc_info=True)
+            return {
+                "error": "Internal server error",
+                "intent": "ERROR",
+                "message": "Something went wrong. Please try again.",
+                "session_id": session_id,
+            }
+
+    @app.route("/command-async", methods=["POST"])
+    def command_async():
+        """Start processing command in background and return job id immediately."""
+        data = request.get_json(silent=True) or {}
+        if not isinstance(data, dict):
+            return jsonify({"error": "Invalid JSON payload"}), 400
+        text = (data.get("text") or "").strip()
+        page = (data.get("page") or "unknown")
+        frontend_context = _normalize_frontend_context(data.get("context"))
+
+        if not text:
+            return jsonify({"error": "No text provided"}), 400
+        if len(text) > app.max_text_length:
+            return jsonify({"error": f"Text too long (max {app.max_text_length} chars)"}), 400
+
+        session_id = g.session_id
+        job_id = secrets.token_hex(12)
+        with app._jobs_lock:
+            app._jobs[job_id] = {"status": "pending", "created_at": time.time()}
+
+        def _worker(jid, txt, pg, ctx_data, sid):
+            res = _process_text_command(txt, pg, ctx_data, sid)
+            _store_job_result(jid, res)
+
+        thr = threading.Thread(target=_worker, args=(job_id, text, page, frontend_context, session_id), daemon=True)
+        thr.start()
+        return jsonify({"job_id": job_id, "status": "pending"}), 202
+
+    @app.route("/command-result/<job_id>", methods=["GET"])
+    def command_result(job_id):
+        with app._jobs_lock:
+            record = app._jobs.get(job_id)
+        if not record:
+            return jsonify({"error": "Job not found"}), 404
+        if record.get("status") != "done":
+            return jsonify({"job_id": job_id, "status": record.get("status")}), 202
+        return jsonify({"job_id": job_id, "status": "done", "result": record.get("result")})
 
     @app.route("/reload", methods=["POST"])
     def reload_agent():
